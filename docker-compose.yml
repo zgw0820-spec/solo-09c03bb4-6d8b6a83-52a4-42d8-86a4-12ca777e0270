@@ -9,7 +9,27 @@ services:
       - "5432:5432"
     volumes:
       - ./db/01_init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./db/02_primary_marker.sql:/docker-entrypoint-initdb.d/02_primary_marker.sql:ro
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fault_admin -d faultdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 备用只读库：同一套 schema/角色，额外一行 STANDBY-MARKER 便于区分。
+  db_standby:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: faultdb
+      POSTGRES_USER: fault_admin
+      POSTGRES_PASSWORD: fault_admin
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./db/01_init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./db/02_standby_marker.sql:/docker-entrypoint-initdb.d/02_standby_marker.sql:ro
+      - pgdata_standby:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fault_admin -d faultdb"]
       interval: 5s
@@ -21,11 +41,15 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      db_standby:
+        condition: service_healthy
     environment:
       DATABASE_DSN: postgresql://fault_ro:fault_ro@db:5432/faultdb
+      STANDBY_DSN: postgresql://fault_ro:fault_ro@db_standby:5432/faultdb
       POOL_SIZE: "2"
     ports:
       - "8000:8000"
 
 volumes:
   pgdata:
+  pgdata_standby:

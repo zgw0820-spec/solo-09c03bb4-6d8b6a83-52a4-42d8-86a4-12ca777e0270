@@ -35,3 +35,32 @@ class QueryTimeout(QueryServiceError):
 
     code = "query_timeout"
     http_status = 504
+
+
+class UnknownTargetError(QueryServiceError):
+    """Raised when the switchover request names an unconfigured candidate."""
+
+    code = "unknown_target"
+    http_status = 400
+
+
+class SwitchTimeout(QueryServiceError):
+    """Raised when the switchover could not finish within its total deadline.
+
+    The active target is left untouched: the original database keeps
+    serving queries.
+    """
+
+    code = "switch_timeout"
+    http_status = 504
+
+
+class SwitchValidationFailed(QueryServiceError):
+    """Raised when the candidate fails the read-only fault_logs probe.
+
+    The active target is left untouched: the original database keeps
+    serving queries.
+    """
+
+    code = "switch_validation_failed"
+    http_status = 502

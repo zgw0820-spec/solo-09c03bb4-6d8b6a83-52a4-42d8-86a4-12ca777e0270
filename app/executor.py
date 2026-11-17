@@ -28,7 +28,7 @@ import psycopg
 
 from .config import Settings
 from .errors import QueryTimeout
-from .pool import QueryConnectionPool
+from .pool import PoolConn, QueryConnectionPool
 
 logger = logging.getLogger("executor")
 
@@ -43,14 +43,17 @@ class QueryExecutor:
 
         A dead-on-arrival backend (e.g. terminated out-of-band while idle)
         is discarded and rebuilt, then the read-only statement is retried
-        once within the same total deadline.
+        once within the same total deadline.  The response names the actual
+        data source (``source``) so a caller can tell which database served
+        the query while a switchover is in progress.
         """
         last_conn_error: psycopg.Error | None = None
         for attempt in (1, 2):
             wait_started = time.monotonic()
             # Propagate PoolAcquireTimeout as a 503 receipt.  When this
             # raises, no connection was borrowed and no statement was sent.
-            conn = await self._pool.acquire(deadline)
+            pconn = await self._pool.acquire(deadline)
+            conn = pconn.conn
             waited_ms = round((time.monotonic() - wait_started) * 1000, 3)
             acquired_at = time.monotonic()
 
@@ -86,14 +89,14 @@ class QueryExecutor:
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 raise await self._handle_timeout(
-                    conn, task, waited_ms, acquired_at
+                    pconn, task, waited_ms, acquired_at
                 )
             except psycopg.errors.QueryCanceled as exc:
                 # The server-side statement_timeout backstop fired first.
                 # Same recovery protocol, same 504 receipt.
                 logger.warning("statement_timeout backstop fired: %s", exc)
                 raise await self._handle_timeout(
-                    conn, task, waited_ms, acquired_at, backstop=True
+                    pconn, task, waited_ms, acquired_at, backstop=True
                 )
             except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
                 # Connection-level failure (backend terminated/restarted):
@@ -101,21 +104,22 @@ class QueryExecutor:
                 # remains.  Retry is safe because the statement is read-only
                 # and never committed anything on a dead connection.
                 logger.warning("connection-level error, discarding: %s", exc)
-                await self._pool.discard_and_replace(conn)
+                await self._pool.discard_and_replace(pconn)
                 last_conn_error = exc
                 if deadline - time.monotonic() <= 0:
                     raise
                 continue
             except psycopg.Error:
                 # Statement-level error: roll back, verify IDLE, then reuse.
-                await self._rollback_or_discard(conn)
+                await self._rollback_or_discard(pconn)
                 raise
 
             elapsed_ms = round((time.monotonic() - acquired_at) * 1000, 3)
-            await self._pool.release_healthy(conn)
+            await self._pool.release_healthy(pconn)
             return {
                 "status": "ok",
                 "executed": True,
+                "source": pconn.target,
                 "wait_ms": waited_ms,
                 "execution_ms": elapsed_ms,
                 "row_count": len(rows),
@@ -128,12 +132,13 @@ class QueryExecutor:
     # ------------------------------------------------------------------ #
     async def _handle_timeout(
         self,
-        conn: psycopg.AsyncConnection,
+        pconn: PoolConn,
         task: asyncio.Task,
         waited_ms: float,
         acquired_at: float,
         backstop: bool = False,
     ) -> QueryTimeout:
+        conn = pconn.conn
         logger.warning(
             "deadline reached (%s), cancelling statement on backend",
             "server backstop" if backstop else "client deadline",
@@ -171,10 +176,10 @@ class QueryExecutor:
         idle = await self._pool.confirm_idle_or_discard(conn)
         discarded = False
         if idle:
-            await self._pool.release_healthy(conn)
+            await self._pool.release_healthy(pconn)
         else:
             discarded = True
-            await self._pool.discard_and_replace(conn)
+            await self._pool.discard_and_replace(pconn)
 
         elapsed_ms = round((time.monotonic() - acquired_at) * 1000, 3)
         return QueryTimeout(
@@ -183,6 +188,7 @@ class QueryExecutor:
             extra={
                 "status": "timeout",
                 "executed": True,
+                "source": pconn.target,
                 "cancelled": cancel_ok,
                 "connection_discarded": discarded,
                 "wait_ms": waited_ms,
@@ -191,12 +197,12 @@ class QueryExecutor:
             },
         )
 
-    async def _rollback_or_discard(self, conn: psycopg.AsyncConnection) -> None:
-        idle = await self._pool.confirm_idle_or_discard(conn)
+    async def _rollback_or_discard(self, pconn: PoolConn) -> None:
+        idle = await self._pool.confirm_idle_or_discard(pconn.conn)
         if idle:
-            await self._pool.release_healthy(conn)
+            await self._pool.release_healthy(pconn)
         else:
-            await self._pool.discard_and_replace(conn)
+            await self._pool.discard_and_replace(pconn)
 
     @staticmethod
     def _jsonable(row: tuple) -> list[Any]:

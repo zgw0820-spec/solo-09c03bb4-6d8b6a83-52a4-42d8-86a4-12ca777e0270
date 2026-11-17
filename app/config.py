@@ -32,6 +32,9 @@ class Settings:
         "DATABASE_DSN",
         "postgresql://fault_ro:fault_ro@db:5432/faultdb",
     )
+    # Optional standby database, pre-provisioned by Docker Compose.  When
+    # set, the /switchover endpoint may move the shared entry point to it.
+    standby_dsn: str | None = os.environ.get("STANDBY_DSN") or None
     pool_size: int = _int("POOL_SIZE", 2)
     connect_timeout: float = _float("CONNECT_TIMEOUT", 10.0)
     # Server-side statement_timeout acts only as a backstop.  It is set
@@ -40,6 +43,14 @@ class Settings:
     statement_timeout_grace_ms: int = _int("STATEMENT_TIMEOUT_GRACE_MS", 1250)
     # Hard cap on the request body so an analyst cannot submit huge payloads.
     max_sql_chars: int = _int("MAX_SQL_CHARS", 10_000)
+
+    @property
+    def candidates(self) -> dict[str, str]:
+        """Named switchover candidates pre-provisioned by the deployment."""
+        out = {"primary": self.database_dsn}
+        if self.standby_dsn:
+            out["standby"] = self.standby_dsn
+        return out
 
 
 settings = Settings()
